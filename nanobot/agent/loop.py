@@ -13,6 +13,7 @@ from loguru import logger
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
+from nanobot.config.loader import load_config
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
@@ -73,6 +74,9 @@ class AgentLoop:
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
+        cfg = load_config()
+        search_cfg = cfg.tools.web.search
+
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -81,6 +85,9 @@ class AgentLoop:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             brave_api_key=brave_api_key,
+            web_search_provider=search_cfg.provider,
+            web_search_api_key=search_cfg.api_key or brave_api_key,
+            web_search_max_results=search_cfg.max_results,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
         )
@@ -108,7 +115,13 @@ class AgentLoop:
         ))
         
         # Web tools
-        self.tools.register(WebSearchTool(api_key=self.brave_api_key))
+        cfg = load_config()
+        search_cfg = cfg.tools.web.search
+        self.tools.register(WebSearchTool(
+            api_key=search_cfg.api_key or self.brave_api_key,
+            max_results=search_cfg.max_results,
+            provider=search_cfg.provider,
+        ))
         self.tools.register(WebFetchTool())
         
         # Message tool
