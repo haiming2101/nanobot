@@ -121,13 +121,9 @@ class WebSearchTool(Tool):
                         "Content-Type": "application/json",
                     },
                     json={
-                        "model": "llama-3.1-sonar-small-128k-online",
-                        "messages": [
-                            {"role": "system", "content": "Provide concise search results with citations."},
-                            {"role": "user", "content": query},
-                        ],
-                        "temperature": 0.2,
-                        "return_citations": True,
+                        "query": query,
+                        "max_results": n,
+                        "max_tokens_per_page": 1024
                     },
                     timeout=30.0,
                 )
