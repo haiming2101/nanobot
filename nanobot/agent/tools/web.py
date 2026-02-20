@@ -121,9 +121,11 @@ class WebSearchTool(Tool):
                         "Content-Type": "application/json",
                     },
                     json={
-                        "query": query,
-                        "max_results": n,
-                        "max_tokens_per_page": 1024
+                        "model": "sonar",
+                        "messages": [
+                            {"role": "user", "content": query}
+                        ],
+                        "max_tokens": 1024
                     },
                     timeout=30.0,
                 )
@@ -131,7 +133,16 @@ class WebSearchTool(Tool):
 
             data = r.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            citations = data.get("citations", [])
+            
+            # Extract citations from the response
+            citations = []
+            if "citations" in data:
+                citations = data.get("citations", [])
+            elif "choices" in data and len(data["choices"]) > 0:
+                # Try to extract citations from message content
+                message = data["choices"][0].get("message", {})
+                if "citations" in message:
+                    citations = message.get("citations", [])
 
             result = f"Results for: {query}\n\n{content}" if content else f"No results for: {query}"
             if citations:
