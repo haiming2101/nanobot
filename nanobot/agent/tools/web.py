@@ -44,7 +44,7 @@ def _validate_url(url: str) -> tuple[bool, str]:
 
 
 class WebSearchTool(Tool):
-    """Search the web using Brave Search API."""
+    """Search the web using multiple providers (Brave, Perplexity, Serper, Tavily)."""
     
     name = "web_search"
     description = "Search the web. Returns titles, URLs, and snippets."
@@ -57,37 +57,149 @@ class WebSearchTool(Tool):
         "required": ["query"]
     }
     
-    def __init__(self, api_key: str | None = None, max_results: int = 5):
-        self.api_key = api_key or os.environ.get("BRAVE_API_KEY", "")
+    def __init__(self, api_key: str | None = None, max_results: int = 5, provider: str = "brave"):
+        self.provider = provider.lower()
+        self.api_key = api_key or self._get_env_api_key(self.provider)
         self.max_results = max_results
     
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
         if not self.api_key:
-            return "Error: BRAVE_API_KEY not configured"
-        
+
+            return f"Error: API key not configured for provider '{self.provider}'"
+
+        n = min(max(count or self.max_results, 1), 10)
+
+        if self.provider == "brave":
+            return await self._brave(query, n)
+        if self.provider == "perplexity":
+            return await self._perplexity(query, n)
+        if self.provider == "serper":
+            return await self._serper(query, n)
+        if self.provider == "tavily":
+            return await self._tavily(query, n)
+
+        return f"Error: Unknown provider '{self.provider}'"
+
+    def _get_env_api_key(self, provider: str) -> str:
+        env_map = {
+            "brave": "BRAVE_API_KEY",
+            "perplexity": "PERPLEXITY_API_KEY",
+            "serper": "SERPER_API_KEY",
+            "tavily": "TAVILY_API_KEY",
+        }
+        return os.environ.get(env_map.get(provider, ""), "")
+
+    async def _brave(self, query: str, count: int) -> str:
+        """Brave Search API."""
         try:
-            n = min(max(count or self.max_results, 1), 10)
             async with httpx.AsyncClient() as client:
                 r = await client.get(
                     "https://api.search.brave.com/res/v1/web/search",
-                    params={"q": query, "count": n},
+                    params={"q": query, "count": count},
                     headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
-                    timeout=10.0
+                    timeout=10.0,
                 )
                 r.raise_for_status()
-            
+
             results = r.json().get("web", {}).get("results", [])
-            if not results:
-                return f"No results for: {query}"
-            
-            lines = [f"Results for: {query}\n"]
-            for i, item in enumerate(results[:n], 1):
-                lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
-                if desc := item.get("description"):
-                    lines.append(f"   {desc}")
-            return "\n".join(lines)
+            return self._format_results(query, results, lambda x: {
+                "title": x.get("title", ""),
+                "url": x.get("url", ""),
+                "snippet": x.get("description", ""),
+            })
         except Exception as e:
             return f"Error: {e}"
+
+    async def _perplexity(self, query: str, count: int) -> str:
+        """Perplexity API using online model with citations."""
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    "https://api.perplexity.ai/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "llama-3.1-sonar-small-128k-online",
+                        "messages": [
+                            {"role": "system", "content": "Provide concise search results with citations."},
+                            {"role": "user", "content": query},
+                        ],
+                        "temperature": 0.2,
+                        "return_citations": True,
+                    },
+                    timeout=30.0,
+                )
+                r.raise_for_status()
+
+            data = r.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            citations = data.get("citations", [])
+
+            result = f"Results for: {query}\n\n{content}" if content else f"No results for: {query}"
+            if citations:
+                result += "\n\nSources:\n" + "\n".join(
+                    f"{i + 1}. {url}" for i, url in enumerate(citations[:count])
+                )
+            return result
+        except Exception as e:
+            return f"Error: {e}"
+
+    async def _serper(self, query: str, count: int) -> str:
+        """Serper API."""
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    "https://google.serper.dev/search",
+                    headers={"X-API-KEY": self.api_key, "Content-Type": "application/json"},
+                    json={"q": query, "num": count},
+                    timeout=10.0,
+                )
+                r.raise_for_status()
+
+            results = r.json().get("organic", [])
+            return self._format_results(query, results, lambda x: {
+                "title": x.get("title", ""),
+                "url": x.get("link", ""),
+                "snippet": x.get("snippet", ""),
+            })
+        except Exception as e:
+            return f"Error: {e}"
+
+    async def _tavily(self, query: str, count: int) -> str:
+        """Tavily Search API."""
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    "https://api.tavily.com/search",
+                    headers={"Content-Type": "application/json"},
+                    json={"api_key": self.api_key, "query": query, "max_results": count},
+                    timeout=10.0,
+                )
+                r.raise_for_status()
+
+            results = r.json().get("results", [])
+            return self._format_results(query, results, lambda x: {
+                "title": x.get("title", ""),
+                "url": x.get("url", ""),
+                "snippet": x.get("content", ""),
+            })
+        except Exception as e:
+            return f"Error: {e}"
+
+    def _format_results(self, query: str, results: list[dict[str, Any]], mapper: Any) -> str:
+        """Format search results consistently."""
+        if not results:
+            return f"No results for: {query}"
+
+        lines = [f"Results for: {query}\n"]
+        for i, item in enumerate(results, 1):
+            mapped = mapper(item)
+            lines.append(f"{i}. {mapped['title']}\n   {mapped['url']}")
+            if mapped.get("snippet"):
+                lines.append(f"   {mapped['snippet']}")
+        return "\n".join(lines)
 
 
 class WebFetchTool(Tool):
