@@ -55,9 +55,11 @@ class AgentLoop:
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
+        channels_config: "ChannelsConfig | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.cron.service import CronService
+        from nanobot.config.schema import ChannelsConfig
         self.bus = bus
         self.provider = provider
         self.workspace = workspace
@@ -74,6 +76,7 @@ class AgentLoop:
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
+        self.channels_config = channels_config
         cfg = load_config()
         search_cfg = cfg.tools.web.search
 
