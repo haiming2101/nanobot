@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import httpx
 
 from nanobot.agent.tools.base import Tool
+from nanobot.utils.token_tracker import track_model_token_usage
 
 # Shared constants
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
@@ -133,6 +134,14 @@ class WebSearchTool(Tool):
 
             data = r.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+            usage = data.get("usage") if isinstance(data, dict) else None
+            if isinstance(usage, dict):
+                try:
+                    track_model_token_usage(model="perplexity/sonar", usage=usage)
+                except Exception:
+                    # Web search should remain available even if usage tracking fails.
+                    pass
             
             # Extract citations from the response
             citations = []
