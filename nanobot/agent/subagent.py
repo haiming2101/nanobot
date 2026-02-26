@@ -29,6 +29,9 @@ class SubagentManager:
         temperature: float = 0.7,
         max_tokens: int = 4096,
         brave_api_key: str | None = None,
+        web_search_provider: str = "brave",
+        web_search_api_key: str | None = None,
+        web_search_max_results: int = 5,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
     ):
@@ -40,6 +43,9 @@ class SubagentManager:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.brave_api_key = brave_api_key
+        self.web_search_provider = web_search_provider
+        self.web_search_api_key = web_search_api_key or brave_api_key
+        self.web_search_max_results = web_search_max_results
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
@@ -101,7 +107,11 @@ class SubagentManager:
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
             ))
-            tools.register(WebSearchTool(api_key=self.brave_api_key))
+            tools.register(WebSearchTool(
+                api_key=self.web_search_api_key,
+                max_results=self.web_search_max_results,
+                provider=self.web_search_provider,
+            ))
             tools.register(WebFetchTool())
             
             # Build messages with subagent-specific prompt

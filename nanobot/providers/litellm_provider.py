@@ -31,11 +31,17 @@ class LiteLLMProvider(LLMProvider):
         api_key: str | None = None, 
         api_base: str | None = None,
         default_model: str = "anthropic/claude-opus-4-5",
+        fallback_models: list[str] | None = None,
         extra_headers: dict[str, str] | None = None,
         provider_name: str | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
+        if fallback_models is None:
+            fallback_models = [
+                m.strip() for m in os.getenv("NANOBOT_LLM_FALLBACK_MODELS", "").split(",") if m.strip()
+            ]
+        self.fallback_models = fallback_models
         self.extra_headers = extra_headers or {}
         
         # Detect gateway / local deployment.
@@ -220,16 +226,82 @@ class LiteLLMProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-        
+
         try:
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
+            # Retry once with configured fallback models for recoverable errors
+            if self._should_fallback(e):
+                fallback_response = await self._try_fallback(kwargs, original_model, e)
+                if fallback_response is not None:
+                    return fallback_response
+
             # Return error as content for graceful handling
             return LLMResponse(
                 content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
+
+    def _should_fallback(self, error: Exception) -> bool:
+        """Check whether an LLM error should trigger fallback model attempts."""
+        if not self.fallback_models:
+            return False
+
+        status_code = getattr(error, "status_code", None)
+        if status_code in {400, 401, 403, 408, 429, 500, 502, 503, 504}:
+            return True
+
+        # Some providers expose HTTP status only in nested response object
+        response = getattr(error, "response", None)
+        response_status = getattr(response, "status_code", None)
+        if response_status in {400, 401, 403, 408, 429, 500, 502, 503, 504}:
+            return True
+
+        err_name = type(error).__name__.lower()
+        err_text = str(error).lower()
+        fallback_markers = (
+            "timeout",
+            "timed out",
+            "connection",
+            "service unavailable",
+            "model not exist",
+            "model_not_found",
+            "model not found",
+            "authentication",
+            "invalid api key",
+            "permission denied",
+            "access denied",
+        )
+        return any(marker in err_name or marker in err_text for marker in fallback_markers)
+
+    async def _try_fallback(
+        self,
+        base_kwargs: dict[str, Any],
+        original_model: str,
+        initial_error: Exception,
+    ) -> LLMResponse | None:
+        """Try configured fallback models and return first successful response."""
+        tried_errors = [f"{original_model}: {initial_error}"]
+        attempted_models = {base_kwargs["model"]}
+
+        for fallback_model in self.fallback_models:
+            resolved_model = self._resolve_model(fallback_model)
+            if resolved_model in attempted_models:
+                continue
+            attempted_models.add(resolved_model)
+
+            fallback_kwargs = {**base_kwargs, "model": resolved_model}
+            try:
+                response = await acompletion(**fallback_kwargs)
+                return self._parse_response(response)
+            except Exception as fallback_error:
+                tried_errors.append(f"{fallback_model}: {fallback_error}")
+
+        return LLMResponse(
+            content="Error calling LLM (including fallback attempts): " + " | ".join(tried_errors),
+            finish_reason="error",
+        )
     
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
