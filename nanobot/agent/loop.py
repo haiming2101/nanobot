@@ -25,6 +25,7 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import Session, SessionManager
+from nanobot.utils.token_tracker import track_model_token_usage
 
 
 class AgentLoop:
@@ -181,6 +182,22 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+
+    def _record_model_usage(self, usage: dict[str, int] | None, model: str | None = None) -> None:
+        """Persist model token usage if provider returned usage metadata."""
+        if not usage:
+            return
+
+        model_name = model or self.model
+        if not model_name:
+            return
+
+        try:
+            totals = track_model_token_usage(model=model_name, usage=usage)
+            logger.debug("Tracked token usage for {}: {}", model_name, totals)
+        except Exception as e:
+            logger.warning("Failed to track token usage for {}: {}", model_name, e)
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -212,6 +229,7 @@ class AgentLoop:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
+            self._record_model_usage(response.usage, self.model)
 
             if response.has_tool_calls:
                 if on_progress:
@@ -508,6 +526,7 @@ Respond with ONLY valid JSON, no markdown fences."""
                 ],
                 model=self.model,
             )
+            self._record_model_usage(response.usage, self.model)
             text = (response.content or "").strip()
             if not text:
                 logger.warning("Memory consolidation: LLM returned empty response, skipping")
