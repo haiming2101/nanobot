@@ -101,6 +101,10 @@ class AgentLoop:
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
+        self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
+        self._consolidation_locks: dict[str, asyncio.Lock] = {}
+        self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._processing_lock = asyncio.Lock()
         self._register_default_tools()
     
     def _register_default_tools(self) -> None:
@@ -117,6 +121,7 @@ class AgentLoop:
             working_dir=str(self.workspace),
             timeout=self.exec_config.timeout,
             restrict_to_workspace=self.restrict_to_workspace,
+            path_append=self.exec_config.path_append,
         ))
         
         # Web tools
@@ -275,12 +280,17 @@ class AgentLoop:
                     )
                     final_content = None
                     continue
+                clean = self._strip_think(response.content)
+                messages = self.context.add_assistant_message(
+                    messages, clean, reasoning_content=response.reasoning_content,
+                )
+                final_content = clean
                 break
 
         return final_content, tools_used
 
     async def run(self) -> None:
-        """Run the agent loop, processing messages from the bus."""
+        """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
         await self._connect_mcp()
         logger.info("Agent loop started")
@@ -305,6 +315,55 @@ class AgentLoop:
             except asyncio.TimeoutError:
                 continue
     
+                msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+
+            if msg.content.strip().lower() == "/stop":
+                await self._handle_stop(msg)
+            else:
+                task = asyncio.create_task(self._dispatch(msg))
+                self._active_tasks.setdefault(msg.session_key, []).append(task)
+                task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+
+    async def _handle_stop(self, msg: InboundMessage) -> None:
+        """Cancel all active tasks and subagents for the session."""
+        tasks = self._active_tasks.pop(msg.session_key, [])
+        cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
+        for t in tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
+        total = cancelled + sub_cancelled
+        content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content=content,
+        ))
+
+    async def _dispatch(self, msg: InboundMessage) -> None:
+        """Process a message under the global lock."""
+        async with self._processing_lock:
+            try:
+                response = await self._process_message(msg)
+                if response is not None:
+                    await self.bus.publish_outbound(response)
+                elif msg.channel == "cli":
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content="", metadata=msg.metadata or {},
+                    ))
+            except asyncio.CancelledError:
+                logger.info("Task cancelled for session {}", msg.session_key)
+                raise
+            except Exception:
+                logger.exception("Error processing message for session {}", msg.session_key)
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content="Sorry, I encountered an error.",
+                ))
+
     async def close_mcp(self) -> None:
         """Close MCP connections."""
         if self._mcp_stack:
@@ -368,6 +427,10 @@ class AgentLoop:
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
         
         if len(session.messages) > self.memory_window and session.key not in self._consolidating:
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
+
+        unconsolidated = len(session.messages) - session.last_consolidated
+        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
             self._consolidating.add(session.key)
 
             async def _consolidate_and_unlock():
@@ -456,6 +519,34 @@ class AgentLoop:
             channel=origin_channel,
             chat_id=origin_chat_id,
             content=final_content
+    _TOOL_RESULT_MAX_CHARS = 500
+
+    def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
+        """Save new-turn messages into session, truncating large tool results."""
+        from datetime import datetime
+        for m in messages[skip:]:
+            entry = {k: v for k, v in m.items() if k != "reasoning_content"}
+            if entry.get("role") == "tool" and isinstance(entry.get("content"), str):
+                content = entry["content"]
+                if len(content) > self._TOOL_RESULT_MAX_CHARS:
+                    entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+            if entry.get("role") == "user" and isinstance(entry.get("content"), list):
+                entry["content"] = [
+                    {"type": "text", "text": "[image]"} if (
+                        c.get("type") == "image_url"
+                        and c.get("image_url", {}).get("url", "").startswith("data:image/")
+                    ) else c
+                    for c in entry["content"]
+                ]
+            entry.setdefault("timestamp", datetime.now().isoformat())
+            session.messages.append(entry)
+        session.updated_at = datetime.now()
+
+    async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
+        """Delegate to MemoryStore.consolidate(). Returns True on success."""
+        return await MemoryStore(self.workspace).consolidate(
+            session, self.provider, self.model,
+            archive_all=archive_all, memory_window=self.memory_window,
         )
     
     async def _consolidate_memory(self, session, archive_all: bool = False) -> None:
